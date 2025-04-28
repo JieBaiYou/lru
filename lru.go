@@ -2,184 +2,378 @@ package lru
 
 import (
 	"container/list"
+	"fmt"
+	"runtime"
 	"sync"
+	"time"
 )
 
-// Lru 是一个线程安全的 LRU 缓存
-// 缓存有一个固定的大小, 当缓存已满时, 最近最少使用的元素将被删除为新元素腾出空间
-type Lru[K comparable, V any] struct {
-	lock  sync.RWMutex        // 读写锁, 用于并发读写操作的保护
-	items map[K]*list.Element // 哈希表, 用于存储及快速查找元素
-	list  *list.List          // 双向链表, 用于按照元素的访问时间排序
-	size  int                 // 缓存的大小, 最多可以存储的元素个数
+// DefaultCacheSize 是缓存大小的默认值
+const DefaultCacheSize = 10
+
+// Cache 是线程安全的LRU缓存，支持过期时间和自动清理
+type Cache[K comparable, V any] struct {
+	mu              sync.RWMutex        // 读写互斥锁，保证并发安全
+	items           map[K]*list.Element // 存储键到链表节点的映射，用于O(1)时间复杂度查找
+	list            *list.List          // 双向链表，用于维护LRU顺序
+	size            int                 // 缓存的最大容量
+	ttl             time.Duration       // 缓存项的默认过期时间
+	cleanerStopCh   chan struct{}       // 用于停止清理协程的信号通道
+	cleanerInterval time.Duration       // 自动清理的时间间隔
 }
 
-// item 是一个键值对, 用于存储缓存中的元素
-type item[K comparable, V any] struct {
-	k K // 元素的键
-	v V // 元素的值
+// entry 表示缓存中的条目
+type entry[K comparable, V any] struct {
+	key      K         // 缓存项的键
+	value    V         // 缓存项的值
+	expireAt time.Time // 缓存项的过期时间点，零值表示永不过期
 }
 
-// NewLru 创建一个指定大小的 LRU 缓存
-func NewLru[K comparable, V any](size int) *Lru[K, V] {
-	return &Lru[K, V]{
-		size:  size,
-		items: make(map[K]*list.Element),
-		list:  list.New(),
+// entryOption 提供单个缓存项的链式操作
+type entryOption[K comparable, V any] struct {
+	key   K            // 操作的缓存项键
+	cache *Cache[K, V] // 指向所属缓存的引用
+}
+
+// New 创建指定大小的缓存
+// 参数 size: 缓存的最大容量，当容量满时会淘汰最久未使用的项
+// 如果 size <= 0，则使用默认容量DefaultCacheSize
+func New[K comparable, V any](size int) *Cache[K, V] {
+	if size <= 0 {
+		size = DefaultCacheSize // 使用默认缓存大小
+	}
+	return &Cache[K, V]{
+		size:          size,
+		items:         make(map[K]*list.Element),
+		list:          list.New(),
+		cleanerStopCh: make(chan struct{}),
 	}
 }
 
-// Set 向缓存中添加一个元素
-// 如果元素已经存在于缓存中, 则将其移动到链表的头部, 表示最近使用过
-// 如果缓存已满, 则删除最近最少使用的元素, 再添加新的元素
-func (lru *Lru[K, V]) Set(k K, v V) {
-	lru.lock.Lock()
-	defer lru.lock.Unlock()
+// TTL 设置默认过期时间
+// 参数 duration: 所有新缓存项的默认生存时间
+// 返回缓存实例本身，支持链式调用
+func (c *Cache[K, V]) TTL(duration time.Duration) *Cache[K, V] {
+	c.mu.Lock()
+	c.ttl = duration
+	c.mu.Unlock()
+	return c
+}
 
-	// 读取已有的节点
-	if e, ok := lru.items[k]; ok {
-		e.Value = item[K, V]{k, v}
-		lru.list.MoveToFront(e)
-		return
+// Cleaner 设置自动清理过期项的时间间隔
+// 参数 interval: 清理过期项的时间间隔
+// 返回缓存实例本身，支持链式调用
+// 注意: 使用此方法后，不再使用缓存时应调用Close方法停止清理goroutine，
+// 否则可能导致资源泄漏。推荐使用defer cache.Close()
+func (c *Cache[K, V]) Cleaner(interval time.Duration) *Cache[K, V] {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.startCleaner(interval)
+
+	// 设置finalizer，防止用户忘记调用Close方法
+	runtime.SetFinalizer(c, func(c *Cache[K, V]) {
+		// 避免在finalizer中持有对象引用，创建一个本地副本
+		stopCh := c.cleanerStopCh
+		if stopCh != nil {
+			close(stopCh)
+		}
+	})
+
+	return c
+}
+
+// startCleaner 启动自动清理器
+// 参数 interval: 清理的时间间隔
+// 会先停止现有的清理器（如果有），然后启动新的清理协程
+func (c *Cache[K, V]) startCleaner(interval time.Duration) {
+	// 停止现有的清理器
+	if c.cleanerStopCh != nil {
+		close(c.cleanerStopCh)
 	}
 
-	// 创建新的节点
-	e := lru.list.PushFront(item[K, V]{k, v})
-	lru.items[k] = e
+	c.cleanerInterval = interval
+	c.cleanerStopCh = make(chan struct{})
 
-	// 如果缓存已满, 则删除最近最少使用的元素
-	if lru.list.Len() > lru.size {
-		b := lru.list.Back()
-		if b != nil {
-			lru.list.Remove(b)
-			kv := b.Value.(item[K, V])
-			delete(lru.items, kv.k)
+	go c.cleanerLoop()
+}
+
+// cleanerLoop 定时清理过期元素
+// 内部使用，作为协程运行，会定期调用Purge方法清理过期项
+// 支持panic恢复，确保清理协程不会意外终止
+func (c *Cache[K, V]) cleanerLoop() {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Printf("缓存清理协程崩溃: %v\n", r)
+			// 可选：重启清理器
+			go c.cleanerLoop()
+		}
+	}()
+
+	ticker := time.NewTicker(c.cleanerInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			c.Purge()
+
+		case <-c.cleanerStopCh:
+			return
 		}
 	}
 }
 
-// Get 从缓存中获取指定键对应的值
-// 如果键存在于缓存中, 则将对应元素移动到链表的头部并返回 对应值 和 true
-// 如果键不存在于缓存中, 则返回 nil 和 false
-func (lru *Lru[K, V]) Get(k K) (V, bool) {
-	lru.lock.Lock()
-	defer lru.lock.Unlock()
+// Close 停止自动清理
+// 如果清理器正在运行，则停止它
+// 当不再使用缓存时，应当调用此方法释放资源
+// 建议使用defer语句确保资源被释放: defer cache.Close()
+func (c *Cache[K, V]) Close() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-	// 读取已有的节点
-	e, ok := lru.items[k]
-	if ok {
-		lru.list.MoveToFront(e)
-		return e.Value.(item[K, V]).v, ok
+	if c.cleanerStopCh != nil {
+		close(c.cleanerStopCh)
+		c.cleanerStopCh = nil
 	}
 
-	// 如果键不存在于缓存中, 则返回 nil, false
-	// return reflect.Zero(reflect.TypeOf((*V)(nil)).Elem()).Interface().(V), ok
-	// 创建了类型 V 的零值, 避免了使用反射, 在性能上更优
-	var z V
-	return z, ok
+	// 取消finalizer
+	runtime.SetFinalizer(c, nil)
 }
 
-// Put 更新缓存中元素的值, 但不更新元素的位置
-// 如果元素已经存在于缓存中, 则更新元素的值, 但不更新元素的位置
-// 如果元素不存在于缓存中并且缓存已满, 则删除最近最少使用的元素再添加新元素
-// 如果元素不存在于缓存中并且缓存未满, 则添加新的元素
-func (lru *Lru[K, V]) Put(k K, v V) {
-	lru.lock.Lock()
-	defer lru.lock.Unlock()
+// Purge 清理所有过期项，返回清理的项数
+// 线程安全，会遍历缓存中的所有项并删除已过期的
+// 返回值: 清理的项数
+func (c *Cache[K, V]) Purge() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-	// 如果元素已经存在于缓存中, 则更新元素的值, 但不更新元素的位置
-	if e, ok := lru.items[k]; ok {
-		// 更新元素的值，但不改变其在链表中的位置
-		e.Value = item[K, V]{k, v}
-		return
+	now := time.Now()
+	count := 0
+
+	for e := c.list.Front(); e != nil; {
+		next := e.Next()
+		item := e.Value.(entry[K, V])
+		if !item.expireAt.IsZero() && now.After(item.expireAt) {
+			c.removeElement(e)
+			count++
+		}
+		e = next
 	}
 
-	// 创建新的节点
-	e := lru.list.PushFront(item[K, V]{k, v})
-	lru.items[k] = e
+	return count
+}
 
-	// 如果缓存已满, 则删除最近最少使用的元素
-	if lru.list.Len() > lru.size {
-		b := lru.list.Back()
-		if b != nil {
-			lru.list.Remove(b)
-			kv := b.Value.(item[K, V])
-			delete(lru.items, kv.k)
+// Set 添加或更新缓存项，返回链式调用句柄
+// 参数 key: 缓存项的键
+// 参数 value: 缓存项的值
+// 返回值: 指向该缓存项的句柄，可用于进一步设置过期时间
+// 如果添加新项导致缓存超出容量，会删除最久未使用的项
+func (c *Cache[K, V]) Set(key K, value V) *entryOption[K, V] {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// 计算新的过期时间
+	var expireAt time.Time
+	if c.ttl > 0 {
+		expireAt = time.Now().Add(c.ttl)
+	}
+
+	if e, ok := c.items[key]; ok {
+		// 更新项 - 延长过期时间(除非原项永不过期)
+		item := e.Value.(entry[K, V])
+		if !item.expireAt.IsZero() { // 仅当原项有过期时间时更新
+			e.Value = entry[K, V]{key, value, expireAt}
+		} else {
+			e.Value = entry[K, V]{key, value, time.Time{}} // 保持永不过期
+		}
+		c.list.MoveToFront(e)
+	} else {
+		// 新增项 - 使用计算的过期时间
+		e := c.list.PushFront(entry[K, V]{key, value, expireAt})
+		c.items[key] = e
+
+		if c.list.Len() > c.size {
+			c.removeOldest()
 		}
 	}
+
+	return &entryOption[K, V]{key: key, cache: c}
 }
 
-// Take 获取指定键对应的值, 但不会修改元素的位置
-// 如果键存在于缓存中, 则返回 true 和对应的值
-// 如果键不存在于缓存中, 则返回 false 和 nil
-func (lru *Lru[K, V]) Take(k K) (V, bool) {
-	lru.lock.RLock()
-	defer lru.lock.RUnlock()
+// Expire 为单个缓存项设置过期时间
+// 参数 duration: 过期时间，如果为0或负值则表示永不过期
+// 返回值: 指向该缓存项的句柄，支持链式调用
+func (h *entryOption[K, V]) Expire(duration time.Duration) *entryOption[K, V] {
+	h.cache.mu.Lock()
+	defer h.cache.mu.Unlock()
 
-	// 读取已有的节点
-	e, ok := lru.items[k]
-	if ok {
-		return e.Value.(item[K, V]).v, ok
+	if e, ok := h.cache.items[h.key]; ok {
+		item := e.Value.(entry[K, V])
+		expireAt := time.Time{}
+		if duration > 0 {
+			expireAt = time.Now().Add(duration)
+		}
+		e.Value = entry[K, V]{item.key, item.value, expireAt}
 	}
 
-	// 如果键不存在于缓存中, 则返回 nil, false
-	// return reflect.Zero(reflect.TypeOf((*V)(nil)).Elem()).Interface().(V), ok
-	// 创建了类型 V 的零值, 避免了使用反射, 在性能上更优
-	var z V
-	return z, ok
+	return h
 }
 
-// Del 从缓存中删除指定键对应的元素
-// 如果键存在于缓存中, 则删除对应元素并返回 true
-// 如果键不存在于缓存中, 则返回 false
-func (lru *Lru[K, V]) Del(k K) bool {
-	lru.lock.Lock()
-	defer lru.lock.Unlock()
+// Get 获取缓存项的值，如果不存在或已过期则返回零值和false
+// 参数 key: 要获取的缓存项键
+// 返回值: 缓存项的值和是否存在/有效的标志
+// 注意: 成功获取会将该项移到最近使用位置
+func (c *Cache[K, V]) Get(key K) (V, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-	// 读取已有的节点
-	if e, ok := lru.items[k]; ok {
-		lru.list.Remove(e)
-		delete(lru.items, k)
+	return c.get(key, true)
+}
+
+// get 内部获取方法，控制是否更新位置
+// 参数 key: 要获取的缓存项键
+// 参数 updatePos: 是否更新项在链表中的位置（移到最前）
+// 返回值: 缓存项的值和是否存在/有效的标志
+func (c *Cache[K, V]) get(key K, updatePos bool) (V, bool) {
+	if e, ok := c.items[key]; ok {
+		item := e.Value.(entry[K, V])
+		// 检查是否过期
+		if item.expireAt.IsZero() || time.Now().Before(item.expireAt) {
+			if updatePos {
+				c.list.MoveToFront(e)
+			}
+			return item.value, true
+		}
+		// 已过期，删除
+		c.removeElement(e)
+	}
+	var zero V
+	return zero, false
+}
+
+// Peek 获取值但不更新位置
+// 参数 key: 要获取的缓存项键
+// 返回值: 缓存项的值和是否存在/有效的标志
+// 与Get不同，不会影响项的LRU顺序
+func (c *Cache[K, V]) Peek(key K) (V, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	return c.get(key, false)
+}
+
+// Delete 删除缓存项
+// 参数 key: 要删除的缓存项键
+// 返回值: 是否找到并删除了该项
+func (c *Cache[K, V]) Delete(key K) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if e, ok := c.items[key]; ok {
+		c.removeElement(e)
 		return true
 	}
-
 	return false
 }
 
-// Len 返回缓存中元素的个数
-func (lru *Lru[K, V]) Len() int {
-	lru.lock.RLock()
-	defer lru.lock.RUnlock()
-	return lru.list.Len()
+// Size 返回当前缓存中的项数
+// 返回值: 当前缓存中有效项的数量
+func (c *Cache[K, V]) Size() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.list.Len()
 }
 
-// Range 遍历缓存中的所有元素
-// 遍历顺序为从链表头部到尾部, 即最近访问的元素在前
-// 如果返回 false, 则停止遍历
-func (lru *Lru[K, V]) Range(f func(k, v any) bool) {
-	lru.lock.RLock()
-	defer lru.lock.RUnlock()
+// Capacity 返回缓存容量
+// 返回值: 缓存的最大容量
+func (c *Cache[K, V]) Capacity() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.size
+}
 
-	for e := lru.list.Front(); e != nil; e = e.Next() {
-		item := e.Value.(item[K, V])
-		if !f(item.k, item.v) {
-			break
+// SetCapacity 调整缓存容量
+// 参数 size: 新的缓存容量
+// 如果参数无效（小于等于0），会使用默认容量DefaultCacheSize
+// 如果新容量小于当前项数，会删除最久未使用的项直到符合新容量
+func (c *Cache[K, V]) SetCapacity(size int) {
+	if size <= 0 {
+		size = DefaultCacheSize
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.size = size
+	// 如果当前大小超过新容量，移除多余项
+	for c.list.Len() > c.size {
+		c.removeOldest()
+	}
+}
+
+// Keys 返回所有未过期的键
+// 返回值: 包含所有未过期键的切片，按照最近使用顺序排列
+func (c *Cache[K, V]) Keys() []K {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	keys := make([]K, 0, c.list.Len())
+	now := time.Now()
+
+	for e := c.list.Front(); e != nil; e = e.Next() {
+		item := e.Value.(entry[K, V])
+		if item.expireAt.IsZero() || now.Before(item.expireAt) {
+			keys = append(keys, item.key)
+		}
+	}
+
+	return keys
+}
+
+// Range 遍历所有未过期的缓存项
+// 参数 fn: 对每个有效缓存项调用的函数，返回false可停止遍历
+// 遍历过程是按照最近使用顺序进行的
+func (c *Cache[K, V]) Range(fn func(K, V) bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	now := time.Now()
+	for e := c.list.Front(); e != nil; e = e.Next() {
+		item := e.Value.(entry[K, V])
+		if item.expireAt.IsZero() || now.Before(item.expireAt) {
+			if !fn(item.key, item.value) {
+				break
+			}
 		}
 	}
 }
 
-// Flush 删除所有元素
-// 该方法不会释放缓存的内存, 仅仅是将缓存中的元素全部删除
-// 如果需要释放缓存的内存, 则需要将缓存的指针设置为 nil
-// 例如: lru = nil
-func (lru *Lru[K, V]) Flush() {
-	lru.lock.Lock()
-	defer lru.lock.Unlock()
+// Clear 清空缓存
+// 删除缓存中的所有项
+func (c *Cache[K, V]) Clear() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-	// 显式地删除 items 中的键值对, 否则某些类型的键值对仍然会占用内存, 比如map
-	for k := range lru.items {
-		delete(lru.items, k)
+	c.list.Init()
+	c.items = make(map[K]*list.Element)
+}
+
+// removeOldest 删除最久未使用的项
+// 内部方法，从链表尾部删除元素
+// 调用前必须持有锁
+func (c *Cache[K, V]) removeOldest() {
+	if e := c.list.Back(); e != nil {
+		c.removeElement(e)
 	}
+}
 
-	lru.list.Init()
+// removeElement 从缓存中删除元素
+// 参数 e: 要删除的链表元素
+// 内部方法，从链表和映射中删除指定元素
+// 调用前必须持有锁
+func (c *Cache[K, V]) removeElement(e *list.Element) {
+	c.list.Remove(e)
+	item := e.Value.(entry[K, V])
+	delete(c.items, item.key)
 }
